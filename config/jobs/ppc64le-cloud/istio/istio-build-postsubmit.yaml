@@ -1,0 +1,79 @@
+postsubmits:
+  ppc64le/build-scripts:
+    - name: postsubmit-istio-build-job
+      cluster: k8s-ppc64le-cluster
+      decorate: true
+      decoration_config:
+        timeout: 12h
+      run_if_changed: 'i/istio/build.sh'
+      branches:
+        - master
+      spec:
+        containers:
+          - image: quay.io/powercloud/docker-ce-build
+            env:
+              - name: DOCKER_CONFIG_JSON
+                valueFrom:
+                  secretKeyRef:
+                    name: quay-powercloud-regcred
+                    key: .dockerconfigjson
+              - name: COS_BUCKET_PASSWD
+                valueFrom:
+                  secretKeyRef:
+                    name: docker-s3-credentials
+                    key: password
+            securityContext:
+              privileged: true
+            resources:
+              requests:
+                cpu: 4000m
+                memory: 8Gi
+              limits:
+                cpu: 4000m
+                memory: 8Gi
+            command:
+              - /bin/bash
+            args:
+              - -c
+              - |
+                set -xeu
+                # Start dockerd
+                wget -O /tmp/dockerctl.sh https://raw.githubusercontent.com/ppc64le-cloud/docker-ce-build/main/dockerctl.sh
+                chmod +x /tmp/dockerctl.sh 
+                /tmp/dockerctl.sh start
+
+                # setup credentials for pushing to quay.io
+                mkdir -p /root/.docker
+                echo $DOCKER_CONFIG_JSON > /root/.docker/config.json
+                unset DOCKER_CONFIG_JSON
+
+                # build istio components
+                mkdir /workspace/istio
+                cd i/istio
+                BUILD_SCRIPT_DIR=`pwd`
+                sleep 60
+                HUB=quay.io/powercloud
+                #HUB=quay.io/matthieusarter
+                WORK_DIR=/workspace/istio DEBUG=yes HUB=${HUB} ./build.sh
+                docker image tag `docker image ls | grep build-tools | grep -v proxy | awk '{print $3}' | sort -u` ${HUB}/build-tools:prow-latest
+                docker image push ${HUB}/build-tools:prow-latest
+                /tmp/dockerctl.sh stop
+
+                # upload envoy binary to cos bucket
+                BUCKET=ppc64le-docker
+                BUCKET_URL=https://s3.us-south.cloud-object-storage.appdomain.cloud
+                cd /workspace
+                echo ":${COS_BUCKET_PASSWD}"  > .passwd-s3fs
+                chmod 600 .passwd-s3fs
+                mkdir /workspace/bucket
+                s3fs ${BUCKET} /workspace/bucket -o url=${BUCKET_URL} -o passwd_file=/workspace/.passwd-s3fs -o ibm_iam_auth
+                mkdir -p /workspace/bucket/prow-istio
+                cp /workspace/istio/envoy-linux-ppc64le/envoy /workspace/bucket/prow-istio/envoy
+
+                # push a file to GitHub to notify next job
+                #cd /workspace
+                #git clone -branch TODO_PROW_TRACKING_BRANCH https://github.com/ppc64le-cloud/docker-ce-build
+                #date -u +"%F %T %Z" > docker-ce-build/TODO_PROW_TRACKING_DIR/istiobuildtimestamp
+                #git add docker-ce-build/TODO_PROW_TRACKING_DIR/istiobuildtimestamp
+                #git commit -m "istio build completed"
+                #git push

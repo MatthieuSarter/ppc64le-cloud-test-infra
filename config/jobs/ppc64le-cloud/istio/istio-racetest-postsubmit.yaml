@@ -1,0 +1,76 @@
+postsubmits:
+  ppc64le-cloud/docker-ce-build:
+    - name: postsubmit-istio-racetest-job
+      cluster: k8s-ppc64le-cluster
+      decorate: true
+      run_if_changed: 'TODO_PROW_TRACKING_DIR/istiobuildtimestamp'
+      branches:
+        - TODO_PROW_TRACKING_BRANCH
+      spec:
+        containers:
+          - image: quay.io/powercloud/build-tools:latest-prow
+          #- image: quay.io/matthieusarter/build-tools:prow-latest
+            env:
+              - name: COS_BUCKET_PASSWD
+                valueFrom:
+                  secretKeyRef:
+                    name: docker-s3-credentials
+                    key: password
+            securityContext:
+              privileged: true
+            resources:
+              requests:
+                cpu: 4000m
+                memory: 8Gi
+              limits:
+                cpu: 4000m
+                memory: 8Gi
+            command:
+              - /bin/bash
+            args:
+              - -c
+              - |
+                set -xeu
+                # build istio components
+                mkdir -p /workspace
+                cd /workspace
+                git clone https://github.com/istio/istio
+                cd istio
+                BUILD_WITH_CONTAINER=0 make build
+
+                # Fix error 141 when running test: tee >(...) fails
+                #sed -i Makefile.core.mk -e 's/tee >($(JUNIT_REPORT) > $(JUNIT_OUT))/tee $(JUNIT_OUT).tmp ; cat $(JUNIT_OUT).tmp | $(JUNIT_REPORT) > $(JUNIT_OUT)/'
+
+                # install s3fs
+                #apt update && apt install s3fs -y   <= installs v1.86, which does not work with our bucket (requires 1.88+)
+                apt update && apt install -y build-essential autotools-dev manpages-dev autoconf automake libtool libcurl4-openssl-dev libxml2-dev libfuse-dev libssl-dev
+                cd /workspace
+                git clone https://github.com/s3fs-fuse/s3fs-fuse.git
+                cd s3fs-fuse
+                git checkout v1.88
+                ./autogen.sh
+                ./configure
+                make
+                make install
+
+                # Replace go-junit-report with fresher version (original version fails with segfault)
+                cd /workspace
+                git clone https://github.com/jstemmer/go-junit-report.git
+                cd go-junit-report
+                go build
+                cp go-junit-report /usr/bin/go-junit-report
+
+                # download envoy binary from cos bucket
+                BUCKET=ppc64le-docker
+                BUCKET_URL=https://s3.us-south.cloud-object-storage.appdomain.cloud
+                mkdir -p /workspace/bucket
+                cd /workspace
+                echo ":${COS_BUCKET_PASSWD}"  > .passwd-s3fs
+                chmod 600 .passwd-s3fs
+                s3fs ${BUCKET} /workspace/bucket -o url=${BUCKET_URL} -o passwd_file=/workspace/.passwd-s3fs -o ibm_iam_auth
+                cp /workspace/bucket/prow-istio/envoy /workspace/istio/out/linux_ppc64le/envoy
+                cp /workspace/bucket/prow-istio/envoy /workspace/istio/out/linux_ppc64le/release/envoy
+
+                # run tests
+                cd /workspace/istio
+                BUILD_WITH_CONTAINER=0 make -e "T=-v -count=1" racetest binaries-test
